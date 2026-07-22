@@ -7,7 +7,7 @@ package io.debezium.server.jdbc;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import jakarta.annotation.PostConstruct;
@@ -18,25 +18,16 @@ import jakarta.inject.Named;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.eclipse.microprofile.config.Config;
 import org.eclipse.microprofile.config.ConfigProvider;
-import org.hibernate.SessionFactory;
-import org.hibernate.StatelessSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
 import io.debezium.Module;
 import io.debezium.config.Field;
-import io.debezium.connector.jdbc.JdbcChangeEventSink;
 import io.debezium.connector.jdbc.JdbcSinkConnectorConfig;
-import io.debezium.connector.jdbc.QueryBinderResolver;
-import io.debezium.connector.jdbc.RecordWriter;
-import io.debezium.connector.jdbc.UnnestRecordWriter;
-import io.debezium.connector.jdbc.dialect.DatabaseDialect;
-import io.debezium.connector.jdbc.dialect.DatabaseDialectResolver;
-import io.debezium.connector.jdbc.metrics.JdbcSinkConnectorMetrics;
+import io.debezium.connector.jdbc.JdbcSinkConnectorTask;
 import io.debezium.metadata.ComponentMetadata;
 import io.debezium.metadata.ComponentMetadataFactory;
-import io.debezium.openlineage.ConnectorContext;
 import io.debezium.runtime.BatchEvent;
 import io.debezium.runtime.CapturingEvents;
 import io.debezium.server.BaseChangeConsumer;
@@ -44,20 +35,13 @@ import io.debezium.server.api.DebeziumServerConsumer;
 import io.debezium.server.api.DebeziumServerSink;
 
 /**
- * Implementation of the consumer that delivers change events to a JDBC database
- * using the Debezium JDBC connector.
+ * Implementation of the consumer that delivers change events to a JDBC database.
  * <p>
- * This consumer wraps JdbcChangeEventSink and manages the complete lifecycle including:
- * - Hibernate SessionFactory creation and cleanup
- * - StatelessSession management
- * - Database dialect resolution
- * - Configuration transformation from debezium.sink.jdbc.* properties
- * - Conversion from ChangeEvent to SinkRecord
- * <p>
- * The consumer is responsible for SessionFactory lifecycle because JdbcChangeEventSink
- * expects a session to be provided but does not manage the factory itself.
+ * Delegates to {@link JdbcSinkConnectorTask} for all JDBC sink logic including
+ * initialization, dialect resolution, record writer selection, and shutdown.
+ * This ensures the Debezium Server JDBC sink always stays in sync with the
+ * Kafka Connect JDBC sink connector.
  *
- * @author Mario Fiore Vitale
  */
 @Named("jdbc")
 @Dependent
@@ -65,69 +49,24 @@ public class JdbcChangeConsumer extends BaseChangeConsumer implements DebeziumSe
 
     private static final Logger LOGGER = LoggerFactory.getLogger(JdbcChangeConsumer.class);
     private static final String PROP_PREFIX = "debezium.sink.jdbc.";
-    private static final String CONNECTOR_LOGICAL_NAME = "debezium-server-jdbc";
-    private static final String CONNECTOR_NAME = "jdbc";
-    private static final String TASK_ID = "0";
 
     private final ComponentMetadataFactory componentMetadataFactory = new ComponentMetadataFactory();
     private final ChangeEventToSinkRecordConverter converter = new ChangeEventToSinkRecordConverter();
-    private final JdbcSinkConnectorMetrics metrics = new JdbcSinkConnectorMetrics(CONNECTOR_NAME, TASK_ID);
 
-    // Lifecycle managed components
-    private SessionFactory sessionFactory;
-    private StatelessSession session;
-    private JdbcChangeEventSink changeEventSink;
-    private JdbcChangeConsumerConfig config;
+    private JdbcSinkConnectorTask task;
 
     @PostConstruct
     void connect() {
         LOGGER.info("Initializing JDBC sink");
 
         try {
-            Config mpConfig = ConfigProvider.getConfig();
-            io.debezium.config.Configuration configuration = io.debezium.config.Configuration.from(getConfigSubset(mpConfig, PROP_PREFIX));
+            final Config mpConfig = ConfigProvider.getConfig();
+            final Map<String, String> props = toStringMap(getConfigSubset(mpConfig, PROP_PREFIX));
 
-            this.config = new JdbcChangeConsumerConfig(configuration);
-            JdbcSinkConnectorConfig jdbcConfig = config.getJdbcConfig();
-
-            jdbcConfig.validate();
-
-            metrics.register();
-
-            org.hibernate.cfg.Configuration hibernateConfig = jdbcConfig.getHibernateConfiguration();
-            String connectionUrl = hibernateConfig.getProperty(org.hibernate.cfg.AvailableSettings.JAKARTA_JDBC_URL);
-            LOGGER.info("JDBC connection URL: {}", connectionUrl);
-
-            LOGGER.info("Creating Hibernate SessionFactory");
-            this.sessionFactory = jdbcConfig.getHibernateConfiguration().buildSessionFactory();
-
-            LOGGER.debug("Opening Hibernate StatelessSession");
-            this.session = sessionFactory.openStatelessSession();
-
-            DatabaseDialect dialect = DatabaseDialectResolver.resolve(jdbcConfig, sessionFactory);
-            LOGGER.info("Resolved database dialect: {}", dialect.getClass().getSimpleName());
-
-            QueryBinderResolver queryBinderResolver = new QueryBinderResolver();
-
-            RecordWriter recordWriter = createRecordWriter(
-                    session, queryBinderResolver, jdbcConfig, dialect);
-
-            ConnectorContext connectorContext = new ConnectorContext(
-                    CONNECTOR_LOGICAL_NAME,
-                    CONNECTOR_NAME,
-                    TASK_ID,
-                    Module.version(),
-                    UUID.randomUUID(),
-                    new java.util.HashMap<>());
-
-            this.changeEventSink = new JdbcChangeEventSink(
-                    jdbcConfig, session, dialect, recordWriter, connectorContext, metrics);
+            this.task = new JdbcSinkConnectorTask();
+            task.start(props);
 
             LOGGER.info("JDBC sink initialized successfully");
-            LOGGER.info("Insert mode: {}", jdbcConfig.getInsertMode());
-            LOGGER.info("Schema evolution: {}", jdbcConfig.getSchemaEvolutionMode());
-            LOGGER.info("Batch size: {}", jdbcConfig.getBatchSize());
-
         }
         catch (Exception e) {
             LOGGER.error("Failed to initialize JDBC sink", e);
@@ -136,39 +75,45 @@ public class JdbcChangeConsumer extends BaseChangeConsumer implements DebeziumSe
         }
     }
 
-    private RecordWriter createRecordWriter(
-                                            StatelessSession session,
-                                            QueryBinderResolver queryBinderResolver,
-                                            JdbcSinkConnectorConfig config,
-                                            DatabaseDialect dialect) {
-
-        return new UnnestRecordWriter(session, queryBinderResolver, config, dialect, metrics);
-    }
-
     @Override
-    public void handle(CapturingEvents<BatchEvent> events)
-            throws InterruptedException {
+    public void handle(CapturingEvents<BatchEvent> events) throws InterruptedException {
 
         LOGGER.debug("Processing batch of {} records", events.records().size());
 
+        final Collection<SinkRecord> sinkRecords = events.records().stream()
+                .map(converter::convert)
+                .collect(Collectors.toList());
+
+        DebeziumException putException = null;
         try {
-            Collection<SinkRecord> sinkRecords = events.records().stream()
-                    .map(converter::convert)
-                    .collect(Collectors.toList());
-
-            changeEventSink.execute(sinkRecords);
-
-            for (BatchEvent record : events.records()) {
-                record.commit();
-            }
-
-            LOGGER.debug("Successfully processed batch of {} records", events.records().size());
-
+            task.put(sinkRecords);
         }
         catch (Exception e) {
-            LOGGER.error("Failed to process batch of {} records", events.records().size(), e);
-            throw new DebeziumException("Failed to process batch", e);
+            LOGGER.error("JdbcSinkTask failed", e);
+            putException = new DebeziumException("JdbcSinkTask failed", e);
         }
+        finally {
+            final Throwable lastException = task.getLastProcessingException();
+            if (lastException != null) {
+                if (putException != null) {
+                    putException.addSuppressed(lastException);
+                }
+                else {
+                    putException = new DebeziumException(
+                            "Failed to process batch", lastException);
+                }
+            }
+        }
+        if (putException != null) {
+            close();
+            throw putException;
+        }
+
+        for (BatchEvent record : events.records()) {
+            record.commit();
+        }
+
+        LOGGER.debug("Successfully processed batch of {} records", events.records().size());
     }
 
     @PreDestroy
@@ -176,42 +121,15 @@ public class JdbcChangeConsumer extends BaseChangeConsumer implements DebeziumSe
     public void close() {
         LOGGER.info("Closing JDBC sink");
 
-        if (changeEventSink != null) {
+        if (task != null) {
             try {
-                LOGGER.debug("Closing JdbcChangeEventSink");
-                changeEventSink.close();
+                task.stop();
             }
             catch (Exception e) {
-                LOGGER.warn("Error closing JdbcChangeEventSink", e);
+                LOGGER.warn("Error stopping JDBC sink task", e);
             }
             finally {
-                changeEventSink = null;
-            }
-        }
-
-        if (session != null && session.isOpen()) {
-            try {
-                LOGGER.debug("Closing StatelessSession");
-                session.close();
-            }
-            catch (Exception e) {
-                LOGGER.warn("Error closing session", e);
-            }
-            finally {
-                session = null;
-            }
-        }
-
-        if (sessionFactory != null && !sessionFactory.isClosed()) {
-            try {
-                LOGGER.info("Closing Hibernate SessionFactory");
-                sessionFactory.close();
-            }
-            catch (Exception e) {
-                LOGGER.warn("Error closing SessionFactory", e);
-            }
-            finally {
-                sessionFactory = null;
+                task = null;
             }
         }
 
@@ -220,14 +138,17 @@ public class JdbcChangeConsumer extends BaseChangeConsumer implements DebeziumSe
 
     @Override
     public Field.Set getConfigFields() {
-        if (config != null) {
-            return config.getAllConfigurationFields();
-        }
         return JdbcSinkConnectorConfig.ALL_FIELDS;
     }
 
     @Override
     public List<ComponentMetadata> getConnectorMetadata() {
         return List.of(componentMetadataFactory.createComponentMetadata(this, Module.version()));
+    }
+
+    private static Map<String, String> toStringMap(Map<String, Object> source) {
+        return source.entrySet().stream()
+                .filter(e -> e.getValue() != null)
+                .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().toString()));
     }
 }
