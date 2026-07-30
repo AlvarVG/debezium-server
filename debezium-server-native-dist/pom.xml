@@ -8,9 +8,11 @@
         <groupId>io.debezium</groupId>
         <artifactId>debezium-server</artifactId>
         <version>3.7.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <artifactId>debezium-server-native-dist</artifactId>
+    <name>Debezium Native Server Distribution</name>
     <packaging>jar</packaging>
 
 
