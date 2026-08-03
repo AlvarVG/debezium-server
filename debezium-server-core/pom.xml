@@ -74,6 +74,16 @@
             <artifactId>debezium-openlineage-api</artifactId>
         </dependency>
 
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-storage-api</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-storage-common</artifactId>
+        </dependency>
+
         <!-- Testing -->
         <dependency>
             <groupId>io.debezium</groupId>
